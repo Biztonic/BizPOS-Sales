@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 import '../database/local_db_service.dart';
 import '../sync/sync_engine.dart';
+import '../models/sync_queue_item.dart';
 import 'dart:async';
 
 class TeamProvider with ChangeNotifier {

@@ -7,6 +7,7 @@ import '../models/quotation.dart';
 import '../repositories/sales_repository.dart';
 import '../repositories/product_repository.dart';
 import '../sync/sync_engine.dart';
+import '../models/sync_queue_item.dart';
 
 class SalesProvider with ChangeNotifier {
   final SalesRepository _salesRepository = SalesRepository();
@@ -349,6 +350,136 @@ class SalesProvider with ChangeNotifier {
         notifyListeners();
       }
     });
+  }
+
+  Future<void> syncProductsFromSettings() async {
+    _isLoading = true;
+    notifyListeners();
+    try {
+      await _productRepository.syncProductsFromFirestore();
+      _products = _productRepository.getLocalProducts();
+      _isLoading = false;
+      notifyListeners();
+    } catch (e) {
+      _error = 'Failed to sync products: $e';
+      _isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<bool> createQuotation(Quotation quotation) async {
+    final id = await addQuotation(quotation);
+    return id != null;
+  }
+
+  Future<bool> updateQuotation(Quotation quotation) async {
+    try {
+      final map = quotation.toMap(isUpdate: true);
+      map['id'] = quotation.id;
+      map['updatedAt'] = DateTime.now().toIso8601String();
+
+      await _salesRepository.localDb.saveItem('quotations', quotation.id, map);
+      
+      final index = _quotations.indexWhere((q) => q.id == quotation.id);
+      if (index != -1) {
+        _quotations[index] = quotation;
+        notifyListeners();
+      }
+
+      await _salesRepository.localDb.enqueueSyncItem(SyncQueueItem(
+        id: UniqueKey().toString(),
+        entityId: quotation.id,
+        entityType: 'quotation',
+        operation: 'UPDATE',
+        payload: map,
+        createdAt: DateTime.now(),
+      ));
+      SyncEngine().flushQueue();
+      return true;
+    } catch (e) {
+      _error = 'Failed to update quotation: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<bool> deleteQuotation(String quotationId) async {
+    try {
+      await _salesRepository.localDb.deleteItem('quotations', quotationId);
+      _quotations.removeWhere((q) => q.id == quotationId);
+      notifyListeners();
+      
+      await _salesRepository.localDb.enqueueSyncItem(SyncQueueItem(
+        id: UniqueKey().toString(),
+        entityId: quotationId,
+        entityType: 'quotation',
+        operation: 'DELETE',
+        payload: {},
+        createdAt: DateTime.now(),
+      ));
+      SyncEngine().flushQueue();
+      return true;
+    } catch (e) {
+      _error = 'Failed to delete quotation: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<List<Quotation>> fetchQuotationsByCustomer(String customerId) async {
+    return _quotations.where((q) => q.customerId == customerId).toList();
+  }
+
+  Future<bool> addPayment(String transactionId, double paymentAmount) async {
+    try {
+      final cached = _salesRepository.localDb.getItem('sales_transactions', transactionId);
+      if (cached == null) return false;
+
+      final currentPaid = (cached['amountPaid'] ?? 0.0).toDouble();
+      final totalAmount = (cached['amount'] ?? 0.0).toDouble();
+      final newPaid = currentPaid + paymentAmount;
+      
+      String paymentStatus = 'PENDING';
+      if (newPaid > 0 && newPaid < totalAmount) {
+        paymentStatus = 'PARTIAL';
+      } else if (newPaid >= totalAmount) {
+        paymentStatus = 'PAID';
+      }
+
+      cached['amountPaid'] = newPaid;
+      cached['paymentStatus'] = paymentStatus;
+      cached['updatedAt'] = DateTime.now().toIso8601String();
+
+      await _salesRepository.localDb.saveItem('sales_transactions', transactionId, cached);
+      
+      final index = _transactions.indexWhere((t) => t.id == transactionId);
+      if (index != -1) {
+        _transactions[index] = _transactions[index].copyWith(
+          amountPaid: newPaid,
+          paymentStatus: paymentStatus,
+        );
+        notifyListeners();
+      }
+
+      await _salesRepository.localDb.enqueueSyncItem(SyncQueueItem(
+        id: UniqueKey().toString(),
+        entityId: transactionId,
+        entityType: 'transaction',
+        operation: 'UPDATE',
+        payload: {
+          'amountPaid': newPaid,
+          'paymentStatus': paymentStatus,
+          'updatedAt': DateTime.now().toIso8601String(),
+        },
+        createdAt: DateTime.now(),
+      ));
+      SyncEngine().flushQueue();
+      return true;
+    } catch (e) {
+      _error = 'Failed to add payment: $e';
+      notifyListeners();
+      return false;
+    }
   }
 
   void clearError() {

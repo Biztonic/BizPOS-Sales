@@ -420,4 +420,31 @@ class SalesRepository extends BaseRepository {
       return null;
     }
   }
+
+  Future<List<Map<String, dynamic>>> fetchLinkedOrders(String storeId) async {
+    try {
+      final snapshot = await db.collection('orders')
+          .where('storeId', isEqualTo: storeId)
+          .orderBy('date', descending: true)
+          .limit(50)
+          .get();
+      return snapshot.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+    } catch (e) {
+      debugPrint('Error fetching linked orders: $e');
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchProductCatalog(String storeId) async {
+    try {
+      final snapshot = await db.collection('inventory')
+          .where('storeId', isEqualTo: storeId)
+          .where('deletedAt', isNull: true)
+          .get();
+      return snapshot.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+    } catch (e) {
+      debugPrint('Error fetching product catalog: $e');
+      return [];
+    }
+  }
 }

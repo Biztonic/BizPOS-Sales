@@ -50,16 +50,20 @@ class CustomerProvider with ChangeNotifier {
   }
 
   Future<void> fetchCustomers({
-    required String userId,
-    required String role,
-    required String storeId,
+    String? userId,
+    String? role,
+    String? storeId,
     List<String>? teamMemberIds,
     bool forceSync = false,
   }) async {
-    _lastUserId = userId;
-    _lastRole = role;
-    _lastStoreId = storeId;
-    _lastTeamMemberIds = teamMemberIds;
+    final effectiveUserId = userId ?? _lastUserId ?? '';
+    final effectiveRole = role ?? _lastRole ?? 'Sales Executive';
+    final effectiveStoreId = storeId ?? _lastStoreId ?? 'DEFAULT_STORE';
+
+    _lastUserId = effectiveUserId;
+    _lastRole = effectiveRole;
+    _lastStoreId = effectiveStoreId;
+    if (teamMemberIds != null) _lastTeamMemberIds = teamMemberIds;
 
     _isLoading = true;
     _error = null;
@@ -67,10 +71,10 @@ class CustomerProvider with ChangeNotifier {
 
     try {
       _customers = await _repository.getCustomers(
-        userId: userId,
-        role: role,
-        storeId: storeId,
-        teamMemberIds: teamMemberIds,
+        userId: effectiveUserId,
+        role: effectiveRole,
+        storeId: effectiveStoreId,
+        teamMemberIds: _lastTeamMemberIds,
         forceSync: forceSync,
       );
       _isLoading = false;

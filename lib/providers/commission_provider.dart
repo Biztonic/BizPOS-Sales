@@ -6,6 +6,7 @@ import '../repositories/commission_repository.dart';
 import '../repositories/sales_repository.dart';
 import '../repositories/expense_repository.dart';
 import '../sync/sync_engine.dart';
+import '../models/sync_queue_item.dart';
 
 class CommissionProvider with ChangeNotifier {
   final CommissionRepository _commissionRepository = CommissionRepository();
@@ -258,6 +259,36 @@ class CommissionProvider with ChangeNotifier {
       notifyListeners();
       return false;
     }
+  }
+
+  Future<void> recordSaleCommission({
+    required String transactionId,
+    required String agentId,
+    required String agentName,
+    required String storeId,
+    required double saleAmount,
+    String? customerId,
+  }) async {
+    final now = DateTime.now();
+    final commission = Commission(
+      id: '',
+      agentId: agentId,
+      agentName: agentName,
+      storeId: storeId,
+      transactionId: transactionId,
+      saleAmount: saleAmount,
+      rate: 10.0,
+      amount: saleAmount * 0.10,
+      status: 'Pending',
+      type: 'Commission',
+      createdAt: now,
+      updatedAt: now,
+    );
+
+    await _commissionRepository.createCommission(commission);
+    
+    // Trigger local updates
+    _reloadCommissions(agentId);
   }
 
   @override

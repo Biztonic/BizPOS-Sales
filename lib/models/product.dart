@@ -46,6 +46,28 @@ class Product {
     };
   }
 
+  Product copyWith({
+    String? id,
+    String? name,
+    String? description,
+    double? price,
+    String? type,
+    int? warrantyMonths,
+    bool? isActive,
+    DateTime? createdAt,
+  }) {
+    return Product(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      description: description ?? this.description,
+      price: price ?? this.price,
+      type: type ?? this.type,
+      warrantyMonths: warrantyMonths ?? this.warrantyMonths,
+      isActive: isActive ?? this.isActive,
+      createdAt: createdAt ?? this.createdAt,
+    );
+  }
+
   static DateTime _parseDateTime(dynamic value) {
     if (value == null) return DateTime.now();
     if (value is Timestamp) return value.toDate();

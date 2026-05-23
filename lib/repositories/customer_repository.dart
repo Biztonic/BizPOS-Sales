@@ -200,4 +200,29 @@ class CustomerRepository extends BaseRepository {
       await localDb.enqueueSyncItem(queueItem);
     }
   }
+
+  Future<Customer?> getCustomerById(String id) async {
+    try {
+      final doc = await db.collection('customers').doc(id).get();
+      if (doc.exists && doc.data() != null) {
+        final map = doc.data()!;
+        return Customer(
+          id: id,
+          name: map['name'] ?? '',
+          phone: map['phone'] ?? '',
+          email: map['email'],
+          address: map['address'],
+          status: map['status'] ?? 'LEAD',
+          assignedTo: map['assignedTo'],
+          assignedToName: map['assignedToName'],
+          lastContactedAt: map['lastContactedAt'] is Timestamp ? (map['lastContactedAt'] as Timestamp).toDate() : null,
+          nextFollowUpAt: map['nextFollowUpAt'] is Timestamp ? (map['nextFollowUpAt'] as Timestamp).toDate() : null,
+          createdAt: map['createdAt'] is Timestamp ? (map['createdAt'] as Timestamp).toDate() : DateTime.now(),
+          warranties: [],
+          source: map['source'] ?? 'MANUAL',
+        );
+      }
+    } catch (_) {}
+    return null;
+  }
 }
