@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "259223330355",
+    "project_id": "bizpos-clone",
+    "storage_bucket": "bizpos-clone.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:259223330355:android:ed7bb40c9e62c9c0dbcd46",
+        "android_client_info": {
+          "package_name": "com.bizpos.sales"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCJkt-vet9FodlKezPhFr3ujgZIzOvIOhQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
