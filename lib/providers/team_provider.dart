@@ -1,41 +1,65 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
+import '../database/local_db_service.dart';
+import '../sync/sync_engine.dart';
+import 'dart:async';
 
 class TeamProvider with ChangeNotifier {
+  final LocalDatabaseService _localDb = LocalDatabaseService();
   final FirebaseFirestore _db = FirebaseFirestore.instance;
 
   List<Map<String, dynamic>> _teamMembers = [];
   bool _isLoading = false;
   String? _error;
+  StreamSubscription? _syncEventsSubscription;
+  String? _lastLeaderId;
+  bool _lastIsSuperAdmin = false;
 
   List<Map<String, dynamic>> get teamMembers => _teamMembers;
   bool get isLoading => _isLoading;
   String? get error => _error;
 
-  /// Fetch users based on hierarchy
+  TeamProvider() {
+    _listenToSyncEvents();
+  }
+
+  void _listenToSyncEvents() {
+    _syncEventsSubscription?.cancel();
+    _syncEventsSubscription = SyncEngine().syncEvents.listen((entityType) {
+      if (entityType == 'transaction' || entityType == 'commission' || entityType == 'quotation') {
+        debugPrint("TeamProvider: Sync event $entityType detected. Recalculating team members stats...");
+        if (_lastLeaderId != null) {
+          fetchTeamMembers(_lastLeaderId!, isSuperAdmin: _lastIsSuperAdmin);
+        }
+      }
+    });
+  }
+
+  /// Fetch users based on hierarchy from local Hive database
   Future<void> fetchTeamMembers(String leaderId, {bool isSuperAdmin = false}) async {
+    _lastLeaderId = leaderId;
+    _lastIsSuperAdmin = isSuperAdmin;
     _isLoading = true;
     _error = null;
-    notifyListeners();
+    Future.microtask(() => notifyListeners());
 
     try {
       final now = DateTime.now();
       final currentMonth = DateFormat('yyyy-MM').format(now);
       
-      // Calculate start of month for date-based queries
-      final startOfMonth = DateTime(now.year, now.month, 1);
-      
-      Query userQuery = _db.collection('sales_users');
+      // Load all cached user profiles from local store
+      final List<Map<String, dynamic>> allUsers = _localDb.getAllItems('sync_metadata')
+          .where((item) => item.containsKey('email')) // filters users
+          .toList();
+
+      List<Map<String, dynamic>> members = [];
       if (!isSuperAdmin) {
-        userQuery = userQuery.where('teamLeaderId', isEqualTo: leaderId);
+        members = allUsers.where((u) => u['teamLeaderId'] == leaderId).toList();
       } else {
-        userQuery = userQuery.where(FieldPath.documentId, isNotEqualTo: leaderId);
+        members = allUsers.where((u) => u['id'] != leaderId).toList();
       }
 
-      final userSnapshot = await userQuery.get();
-      final members = userSnapshot.docs.map((doc) => {'id': doc.id, ...(doc.data() as Map<String, dynamic>)}).toList();
-      
       if (members.isEmpty) {
         _teamMembers = [];
         _isLoading = false;
@@ -43,54 +67,29 @@ class TeamProvider with ChangeNotifier {
         return;
       }
 
-      final memberIds = members.map((m) => m['id'] as String).toList();
-
-      // Bulk fetch transactions for the month
-      // Note: Firestore 'whereIn' is limited to 30 items. 
-      // For larger teams, we might need to fetch all transactions for the month and filter by agentId.
-      // Given the small scale, let's fetch all transactions for the month.
-      final txSnapshot = await _db.collection('sales_transactions')
-          .where('targetMonth', isEqualTo: currentMonth)
-          .where('status', isEqualTo: 'Completed')
-          .get();
-
-      // Bulk fetch commissions (using date since 'month' field is missing)
-      final commSnapshot = await _db.collection('commissions')
-          .where('createdAt', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfMonth))
-          .get();
-
-      // Bulk fetch pending quotations
-      final qSnapshot = await _db.collection('quotations')
-          .where('status', isEqualTo: 'PENDING')
-          .get();
+      // Load cached collections locally
+      final cachedTransactions = _localDb.getAllItems('sales_transactions');
+      final cachedCommissions = _localDb.getAllItems('commissions');
+      final cachedQuotations = _localDb.getAllItems('quotations');
 
       // Aggregate data in memory
       for (var member in members) {
         final memberId = member['id'];
         
-        double monthlySales = 0;
-        for (var doc in txSnapshot.docs) {
-          final data = doc.data();
-          if (data['agentId'] == memberId) {
-            monthlySales += (data['amountPaid'] ?? data['amount'] ?? 0).toDouble();
-          }
-        }
+        // 1. Calculate Monthly Sales
+        double monthlySales = cachedTransactions
+            .where((t) => t['agentId'] == memberId && t['targetMonth'] == currentMonth && t['status'] == 'Completed')
+            .fold(0.0, (sum, t) => sum + (t['amountPaid'] ?? t['amount'] ?? 0.0));
 
-        double monthlyComm = 0;
-        for (var doc in commSnapshot.docs) {
-          final data = doc.data();
-          if (data['agentId'] == memberId) {
-            monthlyComm += (data['amount'] ?? 0).toDouble();
-          }
-        }
+        // 2. Calculate Commissions
+        double monthlyComm = cachedCommissions
+            .where((c) => c['agentId'] == memberId)
+            .fold(0.0, (sum, c) => sum + (c['amount'] ?? 0.0));
 
-        int activeQuotes = 0;
-        for (var doc in qSnapshot.docs) {
-          final data = doc.data();
-          if (data['agentId'] == memberId) {
-            activeQuotes++;
-          }
-        }
+        // 3. Count Pending Quotes
+        int activeQuotes = cachedQuotations
+            .where((q) => q['agentId'] == memberId && q['status'] == 'PENDING')
+            .length;
 
         member['monthlySales'] = monthlySales;
         member['totalCommission'] = monthlyComm;
@@ -117,32 +116,34 @@ class TeamProvider with ChangeNotifier {
     notifyListeners();
 
     try {
-      // NOTE: Creating auth users requires FirebaseAuth or a Cloud Function.
-      // For now, we simulate this by just creating the user doc in Firestore 
-      // (assuming they sign up with the same email later, or a Cloud Function creates auth).
-      // A complete implementation would either use Firebase Admin SDK via Cloud Function
-      // or the leader shares a join code.
-      
-      // Let's create a placeholder user document.
-      final docRef = await _db.collection('sales_users').add({
+      final id = UniqueKey().toString();
+      final Map<String, dynamic> userMap = {
+        'id': id,
         'name': name,
         'email': email.trim(),
         'role': 'Sales Executive',
         'teamLeaderId': leaderId,
-        'createdAt': FieldValue.serverTimestamp(),
+        'createdAt': DateTime.now().toIso8601String(),
         'appSource': 'bizpos_sales',
-      });
+      };
 
-      _teamMembers.add({
-        'id': docRef.id,
-        'name': name,
-        'email': email.trim(),
-        'role': 'Sales Executive',
-        'teamLeaderId': leaderId,
-      });
+      // Save locally
+      await _localDb.saveItem('sync_metadata', id, userMap);
 
+      // Enqueue
+      await _localDb.enqueueSyncItem(SyncQueueItem(
+        id: UniqueKey().toString(),
+        entityId: id,
+        entityType: 'sales_user',
+        operation: 'CREATE',
+        payload: userMap,
+        createdAt: DateTime.now(),
+      ));
+
+      _teamMembers.add(userMap);
       _isLoading = false;
       notifyListeners();
+      SyncEngine().flushQueue();
       return true;
     } catch (e) {
       _error = 'Failed to recruit SE: $e';
@@ -155,5 +156,11 @@ class TeamProvider with ChangeNotifier {
   void clearError() {
     _error = null;
     notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _syncEventsSubscription?.cancel();
+    super.dispose();
   }
 }

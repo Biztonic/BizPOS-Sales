@@ -5,6 +5,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:provider/provider.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'firebase_options.dart';
+import 'database/local_db_service.dart';
 
 // Providers
 import 'providers/auth_provider.dart';
@@ -41,11 +42,10 @@ void main() async {
       // or at least show the app shell so it's not a white screen.
     }
 
-    // 2. Initialize Hive (Critical for caching)
+    // 2. Initialize Hive & Local Database Boxes (Critical for caching)
     try {
       await Hive.initFlutter();
-      await Hive.openBox('settings');
-      await Hive.openBox('cache');
+      await LocalDatabaseService().init();
     } catch (e) {
       debugPrint("Hive initialization failed: $e");
     }

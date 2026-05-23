@@ -1,20 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_storage/firebase_storage.dart';
-import '../utils/image_helper.dart';
+import '../repositories/auth_repository.dart';
+import '../sync/sync_engine.dart';
 import 'dart:async';
 import 'dart:typed_data';
 
 class SalesAuthProvider with ChangeNotifier {
+  final AuthRepository _repository = AuthRepository();
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  final FirebaseFirestore _db = FirebaseFirestore.instance;
-  final FirebaseStorage _storage = FirebaseStorage.instance;
 
   User? _user;
   Map<String, dynamic>? _userProfile;
   bool _isLoading = false;
   String? _error;
+  StreamSubscription? _userProfileSubscription;
 
   // Getters
   User? get user => _user;
@@ -26,6 +25,7 @@ class SalesAuthProvider with ChangeNotifier {
   String get userEmail => _user?.email ?? '';
   String get userName => _userProfile?['name'] ?? _user?.displayName ?? '';
   String get userRole => _userProfile?['role'] ?? 'Sales Executive';
+  String get storeId => _userProfile?['storeId'] ?? 'DEFAULT_STORE';
   bool get isSuperAdmin => userRole == 'SuperAdmin';
   bool get isDirector => userRole == 'Director' || isSuperAdmin;
   bool get isTeamLeader => userRole == 'Team Leader' || isDirector;
@@ -37,26 +37,44 @@ class SalesAuthProvider with ChangeNotifier {
     _auth.authStateChanges().listen(_onAuthChanged);
   }
 
-  StreamSubscription? _userProfileSubscription;
-
   void _onAuthChanged(User? user) async {
     _user = user;
     if (user != null) {
       _userProfileSubscription?.cancel();
-      _userProfileSubscription = _db.collection('sales_users').doc(user.uid).snapshots().listen((snapshot) {
-        if (snapshot.exists) {
+
+      // 1. Try to load user profile instantly from local Hive cache
+      _userProfile = await _repository.getUserProfile(user.uid);
+      notifyListeners();
+
+      // 2. Start realtime listener for updates and refresh cache
+      _userProfileSubscription = _repository.db
+          .collection('sales_users')
+          .doc(user.uid)
+          .snapshots()
+          .listen((snapshot) async {
+        if (snapshot.exists && snapshot.data() != null) {
           _userProfile = snapshot.data();
+          await _repository.cacheUserProfile(user.uid, _userProfile!);
           notifyListeners();
+
+          // Initialize sync listener for their store
+          SyncEngine().startSyncListener(storeId, onSyncChange: () {
+            // Callback when delta versions change
+            notifyListeners();
+          });
         }
       });
+
+      // Start Sync Engine queue flushing
+      SyncEngine().start();
+      SyncEngine().flushQueue();
     } else {
       _userProfileSubscription?.cancel();
       _userProfile = null;
+      SyncEngine().stopSyncListener();
     }
     notifyListeners();
   }
-
-  // Remove the old _fetchUserProfile method
 
   Future<bool> signIn(String email, String password) async {
     _isLoading = true;
@@ -95,59 +113,45 @@ class SalesAuthProvider with ChangeNotifier {
     notifyListeners();
 
     try {
-      // 1. Check if this is the very first user
-      final userCheck = await _db.collection('sales_users').limit(1).get();
-      final bool isFirstUser = userCheck.docs.isEmpty && teamLeaderCode.trim().toUpperCase() == 'INITIAL';
+      final isFirst = await _repository.isFirstUser();
+      final isRoot = isFirst && teamLeaderCode.trim().toUpperCase() == 'INITIAL';
 
       String? teamLeaderId;
       String? teamLeaderName;
 
-      if (isFirstUser) {
+      if (isRoot) {
         teamLeaderId = 'SYSTEM';
         teamLeaderName = 'Root System';
       } else {
-        // Verify Team Leader Code
-        final tlQuery = await _db
-            .collection('sales_users')
-            .where('referralCode', isEqualTo: teamLeaderCode.trim().toUpperCase())
-            .get();
-
-        if (tlQuery.docs.isEmpty) {
+        final tlInfo = await _repository.verifyTeamLeaderCode(teamLeaderCode);
+        if (tlInfo == null) {
           _error = 'Invalid Team Leader Code. Please check and try again.';
           _isLoading = false;
           notifyListeners();
           return false;
         }
-
-        final teamLeaderDoc = tlQuery.docs.first;
-        teamLeaderId = teamLeaderDoc.id;
-        teamLeaderName = teamLeaderDoc.data()['name'] ?? 'Unknown';
+        teamLeaderId = tlInfo['id'];
+        teamLeaderName = tlInfo['name'];
       }
 
-      // 2. Create Auth User
-      final credential = await _auth.createUserWithEmailAndPassword(
-        email: email.trim(),
+      final role = isRoot ? 'SuperAdmin' : 'Sales Executive';
+      final generatedReferralCode = isRoot ? 'ROOT' : _uuidReferralFallback();
+
+      final signedUser = await _repository.signUp(
+        email: email,
         password: password,
+        name: name,
+        teamLeaderId: teamLeaderId,
+        teamLeaderName: teamLeaderName,
+        role: role,
+        referralCode: generatedReferralCode,
       );
 
-      // 3. Create user profile in Firestore
-      if (credential.user != null) {
-        final uid = credential.user!.uid;
-        // Generate a unique referral code for this new user
-        // If first user, give them a nice default like 'ROOT' or 'BOSS'
-        final newReferralCode = isFirstUser ? 'ROOT' : uid.substring(0, 4).toUpperCase();
-
-        await _db.collection('sales_users').doc(uid).set({
-          'name': name,
-          'email': email.trim(),
-          'role': isFirstUser ? 'SuperAdmin' : 'Sales Executive',
-          'teamLeaderId': teamLeaderId,
-          'teamLeaderName': teamLeaderName,
-          'referralCode': isFirstUser ? newReferralCode : null, // Sales Executive starts without code
-          'createdAt': FieldValue.serverTimestamp(),
-          'updatedAt': FieldValue.serverTimestamp(),
-          'appSource': 'bizpos_sales',
-        }, SetOptions(merge: true));
+      if (signedUser == null) {
+        _error = 'Failed to create user account.';
+        _isLoading = false;
+        notifyListeners();
+        return false;
       }
 
       _isLoading = false;
@@ -166,9 +170,17 @@ class SalesAuthProvider with ChangeNotifier {
     }
   }
 
+  String _uuidReferralFallback() {
+    // Generate a quick 4-character uppercase code
+    final uid = _auth.currentUser?.uid ?? 'XXXX';
+    return uid.substring(0, 4).toUpperCase();
+  }
+
   Future<void> signOut() async {
+    _userProfileSubscription?.cancel();
     await _auth.signOut();
     _userProfile = null;
+    SyncEngine().stopSyncListener();
     notifyListeners();
   }
 
@@ -179,40 +191,10 @@ class SalesAuthProvider with ChangeNotifier {
     notifyListeners();
 
     try {
-      final sanitizedCode = newCode.trim().toUpperCase();
-      if (sanitizedCode.length != 4) {
-        _error = 'Referral code must be exactly 4 letters.';
-        _isLoading = false;
-        notifyListeners();
-        return false;
-      }
-
-      // Check for uniqueness
-      final duplicateQuery = await _db
-          .collection('sales_users')
-          .where('referralCode', isEqualTo: sanitizedCode)
-          .get();
-
-      if (duplicateQuery.docs.isNotEmpty) {
-        // Check if the duplicate is the current user
-        final isMine = duplicateQuery.docs.any((doc) => doc.id == _user!.uid);
-        if (!isMine) {
-          _error = 'Referral code already taken. Please try another one.';
-          _isLoading = false;
-          notifyListeners();
-          return false;
-        }
-      }
-
-      // Update Firestore
-      await _db.collection('sales_users').doc(_user!.uid).update({
-        'referralCode': sanitizedCode,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-
+      final success = await _repository.updateReferralCode(_user!.uid, newCode);
       _isLoading = false;
       notifyListeners();
-      return true;
+      return success;
     } catch (e) {
       _error = 'Failed to update referral code: $e';
       _isLoading = false;
@@ -220,7 +202,7 @@ class SalesAuthProvider with ChangeNotifier {
       return false;
     }
   }
-  
+
   Future<bool> updateProfilePhoto(Uint8List imageBytes) async {
     if (_user == null) return false;
     _isLoading = true;
@@ -228,34 +210,16 @@ class SalesAuthProvider with ChangeNotifier {
     notifyListeners();
 
     try {
-      // 1. Compress image to under 100kb
-      final compressedBytes = await ImageHelper.compressImage(imageBytes, targetSizeKb: 100);
-      if (compressedBytes == null) {
-        _error = 'Failed to process image.';
-        _isLoading = false;
-        notifyListeners();
-        return false;
-      }
-
-      // 2. Upload to Firebase Storage
-      final storageRef = _storage.ref().child('profile_photos/${_user!.uid}.jpg');
-      final uploadTask = await storageRef.putData(
-        compressedBytes,
-        SettableMetadata(contentType: 'image/jpeg'),
-      );
-
-      // 3. Get Download URL
-      final downloadUrl = await uploadTask.ref.getDownloadURL();
-
-      // 4. Update Firestore
-      await _db.collection('sales_users').doc(_user!.uid).update({
-        'photoUrl': downloadUrl,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-
+      final url = await _repository.uploadProfilePhoto(_user!.uid, imageBytes);
       _isLoading = false;
-      notifyListeners();
-      return true;
+      if (url != null) {
+        if (_userProfile != null) {
+          _userProfile!['photoUrl'] = url;
+        }
+        notifyListeners();
+        return true;
+      }
+      return false;
     } catch (e) {
       _error = 'Failed to upload photo: $e';
       _isLoading = false;
@@ -284,5 +248,11 @@ class SalesAuthProvider with ChangeNotifier {
       default:
         return 'Authentication error: $code';
     }
+  }
+
+  @override
+  void dispose() {
+    _userProfileSubscription?.cancel();
+    super.dispose();
   }
 }
