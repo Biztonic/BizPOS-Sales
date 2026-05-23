@@ -124,9 +124,42 @@ class SyncEngine {
       }
 
       final ref = getRef();
+      final docRef = ref.doc(item.entityId);
+
+      // --- CONFLICT RESOLUTION (Last-Write-Wins & Cache Correction) ---
+      if (item.operation == 'CREATE' || item.operation == 'UPDATE' || item.operation == 'CREATE_OR_UPDATE') {
+        final remoteDoc = await docRef.get();
+        if (remoteDoc.exists && remoteDoc.data() != null) {
+          final remoteData = remoteDoc.data() as Map<String, dynamic>;
+          
+          final DateTime? remoteUpdatedAt = _parseDateTime(remoteData['updatedAt']);
+          final DateTime? localUpdatedAt = _parseDateTime(payload['updatedAt']);
+
+          if (remoteUpdatedAt != null && localUpdatedAt != null && remoteUpdatedAt.isAfter(localUpdatedAt)) {
+            // Conflict Detected: Remote document is newer than our local offline change!
+            debugPrint("Sync Engine Conflict: Remote doc is newer for ${item.entityType}/${item.entityId}. Merging...");
+            
+            // Overwrite local Hive cache with remote data to keep database consistent
+            final String boxName = item.entityType == 'transaction' ? 'sales_transactions' : '${item.entityType}s';
+            
+            // Format remote timestamps to strings for Hive compatibility
+            remoteData['id'] = remoteDoc.id;
+            remoteData.forEach((key, val) {
+              if (val is Timestamp) {
+                remoteData[key] = val.toDate().toIso8601String();
+              }
+            });
+
+            await _localDb.saveItem(boxName, item.entityId, remoteData);
+            
+            // Conflict Resolved: remote-wins, mark as synced successfully (no-op write)
+            return true;
+          }
+        }
+      }
 
       if (item.operation == 'CREATE' || item.operation == 'CREATE_OR_UPDATE') {
-        await ref.doc(item.entityId).set(payload, SetOptions(merge: true));
+        await docRef.set(payload, SetOptions(merge: true));
         
         // --- Precomputed Dashboard Summary Updates ---
         if (item.entityType == 'transaction') {
@@ -146,15 +179,23 @@ class SyncEngine {
         }
 
       } else if (item.operation == 'UPDATE') {
-        await ref.doc(item.entityId).update(payload);
+        await docRef.update(payload);
       } else if (item.operation == 'DELETE') {
-        await ref.doc(item.entityId).delete();
+        await docRef.delete();
       }
       return true;
     } catch (e) {
       debugPrint("Failed to sync item ${item.entityId} to Firestore: $e");
       return false;
     }
+  }
+
+  DateTime? _parseDateTime(dynamic value) {
+    if (value == null) return null;
+    if (value is Timestamp) return value.toDate();
+    if (value is String) return DateTime.tryParse(value);
+    if (value is int) return DateTime.fromMillisecondsSinceEpoch(value);
+    return null;
   }
 
   void _convertDatesToTimestamps(Map<String, dynamic> data) {
